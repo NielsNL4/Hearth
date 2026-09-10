@@ -1,0 +1,28 @@
+{
+  "name": "@hearth/assets",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.883.0",
+    "@aws-sdk/s3-presigned-post": "^3.883.0",
+    "@aws-sdk/s3-request-presigner": "^3.883.0",
+    "@fastify/cors": "^11.1.0",
+    "fastify": "^5.6.0",
+    "sharp": "^0.35.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.1",
+    "tsx": "^4.20.5",
+    "typescript": "~5.9.3"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}

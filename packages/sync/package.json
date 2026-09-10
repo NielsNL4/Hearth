@@ -1,0 +1,13 @@
+{
+  "name": "@hearth/sync",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@hearth/domain": "*",
+    "@hearth/room-schema": "*",
+    "@supabase/supabase-js": "^2.99.0",
+    "colyseus.js": "^0.16.22"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "@hearth/room-schema",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@colyseus/schema": "^5.0.27",
+    "@hearth/scene": "*"
+  }
+}

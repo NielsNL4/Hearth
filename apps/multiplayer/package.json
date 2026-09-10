@@ -1,0 +1,30 @@
+{
+  "name": "@hearth/multiplayer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "start": "tsx src/main.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@colyseus/core": "^0.18.12",
+    "@colyseus/schema": "^5.0.27",
+    "@colyseus/tools": "^0.18.3",
+    "@colyseus/ws-transport": "^0.18.2",
+    "@hearth/domain": "*",
+    "@hearth/room-schema": "*",
+    "@hearth/scene": "*",
+    "@supabase/supabase-js": "^2.99.0",
+    "express": "^5.1.0",
+    "tsx": "^4.20.5",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.3.1",
+    "typescript": "~5.9.3"
+  }
+}
