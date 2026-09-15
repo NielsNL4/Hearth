@@ -4,6 +4,7 @@ import {
   canOpenDoor,
   cloneScene,
   createEmptyScene,
+  createTokenMovementState,
   deserializeScene,
   isDoorLocked,
   migrateSceneV1ToV2,
@@ -32,11 +33,14 @@ describe('SceneV2 parsing and migration', () => {
         type: 'square', visible: true, cellSize: 1, offset: { x: 0, y: 0 },
         distancePerCell: 5, unit: 'ft', snap: true,
       },
-      permissions: { playerMovement: 'owned' },
+      permissions: { playerMovement: 'owned', playerDrawing: 'own', playerPerspectiveView: false },
+      navigationRevision: 0,
+      wallRevision: 0,
       tokens: {}, walls: {},
-      fog: { version: 1, mode: 'shared', operations: [] },
-      drawings: {}, structures: {}, lights: {}, effects: {},
-      initiative: { version: 1, active: false, round: 0, turnIndex: null, entries: [] },
+      fog: { version: 1, mode: 'shared', enabled: false, base: 'revealed', operations: [], revision: 0 },
+      drawings: {}, structures: {}, structureRevision: 0, lights: {}, effects: {},
+      drawingRevision: 0,
+      initiative: { version: 1, active: false, round: 0, turnIndex: null, entries: [], revision: 0 },
       extensions: {},
     });
   });
@@ -54,6 +58,27 @@ describe('SceneV2 parsing and migration', () => {
     expect(migrated.extensions).not.toBe(v1.extensions);
   });
 
+  it('defaults wallRevision for older SceneV2 snapshots', () => {
+    const older = createEmptyScene();
+    delete older.wallRevision;
+    expect(parseSceneV2(older).wallRevision).toBe(0);
+    expect(parseSceneV2(JSON.parse(serializeScene(older)))).toMatchObject({ wallRevision: 0 });
+  });
+
+  it('normalizes legacy structures and defaults new permission state', () => {
+    const older = createEmptyScene();
+    delete older.permissions.playerPerspectiveView;
+    delete older.structureRevision;
+    older.structures.crate = {
+      id: 'crate', position: { x: 1, y: 2 }, size: { width: 2, height: 2 }, rotation: 0,
+      label: 'Crate', z: 1, revision: 0,
+    } as never;
+    const parsed = parseSceneV2(older);
+    expect(parsed.permissions.playerPerspectiveView).toBe(false);
+    expect(parsed.structureRevision).toBe(0);
+    expect(parsed.structures.crate).toMatchObject({ kind: 'block', material: 'default', baseElevation: 0, slabHeight: 1 });
+  });
+
   it('rejects malformed records, mismatched keys, invalid versions, and non-JSON extensions', () => {
     const scene = createEmptyScene();
     scene.tokens.goblin = {
@@ -63,6 +88,54 @@ describe('SceneV2 parsing and migration', () => {
     expect(() => parseSceneV2(scene)).toThrow(/Record id must match its key/);
     expect(() => parseScene({ version: 3 })).toThrow();
     expect(() => parseSceneV2({ ...createEmptyScene(), extensions: { bad: undefined } })).toThrow();
+  });
+
+  it('validates every wall type and rejects invalid door combinations', () => {
+    for (const type of ['blocking', 'terrain', 'ethereal'] as const) {
+      const scene = createEmptyScene();
+      scene.walls[type] = { id: type, type, start: { x: 0, y: 0 }, end: { x: 1, y: 0 }, height: 10, thickness: 1, elevation: 0, material: 'default', openings: [], revision: 0 };
+      expect(parseSceneV2(scene).walls[type]?.type).toBe(type);
+    }
+    for (const doorState of ['open', 'closed', 'locked'] as const) {
+      const scene = createEmptyScene();
+      scene.walls.door = { id: 'door', type: 'door', doorState, start: { x: 0, y: 0 }, end: { x: 1, y: 0 }, height: 10, thickness: 1, elevation: 0, material: 'default', openings: [], revision: 0 };
+      expect(parseSceneV2(scene).walls.door).toMatchObject({ type: 'door', doorState });
+    }
+    const base = { id: 'wall', start: { x: 0, y: 0 }, end: { x: 1, y: 0 }, height: 10, thickness: 1, elevation: 0, revision: 0 };
+    expect(() => parseSceneV2({ ...createEmptyScene(), walls: { wall: { ...base, type: 'blocking', doorState: 'open' } } })).toThrow();
+    expect(() => parseSceneV2({ ...createEmptyScene(), walls: { wall: { ...base, type: 'door', doorState: 'ajar' } } })).toThrow();
+    expect(() => parseSceneV2({ ...createEmptyScene(), walls: { wall: { ...base, type: 'blocking', end: { x: 0, y: 0 } } } })).toThrow(/must have length/);
+    expect(() => parseSceneV2({ ...createEmptyScene(), walls: { different: { ...base, type: 'terrain' } } })).toThrow(/Record id must match its key/);
+  });
+
+  it('defaults wall material and openings while rejecting invalid window openings', () => {
+    const legacyWall = {
+      id: 'legacy', type: 'blocking', start: { x: 0, y: 0 }, end: { x: 10, y: 0 },
+      height: 10, thickness: 1, elevation: 0, revision: 0,
+    };
+    expect(parseSceneV2({ ...createEmptyScene(), walls: { legacy: legacyWall } }).walls.legacy).toMatchObject({ material: 'default', openings: [] });
+    const base = { ...createEmptyScene(), walls: { wall: { ...legacyWall } } };
+    const invalid = [
+      [{ type: 'window', start: .5, end: .5, bottom: 1, height: 2 }],
+      [{ type: 'window', start: .6, end: .9, bottom: 1, height: 2 }, { type: 'window', start: .4, end: .5, bottom: 1, height: 2 }],
+      [{ type: 'window', start: .1, end: .2, bottom: 0, height: 2 }],
+      [{ type: 'window', start: .1, end: .2, bottom: 8, height: 3 }],
+      Array.from({ length: 33 }, () => ({ type: 'window', start: 0, end: .01, bottom: 1, height: 2 })),
+    ];
+    for (const openings of invalid) expect(() => parseSceneV2({ ...base, walls: { wall: { ...legacyWall, openings } } })).toThrow();
+    expect(() => parseSceneV2({ ...base, walls: { wall: { ...legacyWall, type: 'door', doorState: 'closed', openings: [{ type: 'window', start: .1, end: .2, bottom: 1, height: 2 }] } } })).toThrow();
+  });
+
+  it('migrates deterministically through serialization while preserving nested extensions', () => {
+    const input: SceneV1 = {
+      version: 1,
+      grid: { type: 'square', cellSize: 50, offset: { x: -25, y: 75 }, distancePerCell: 5, unit: 'ft' },
+      extensions: { module: { nested: [{ enabled: true }, null, 3] } },
+    };
+    const first = parseScene(JSON.parse(JSON.stringify(input)));
+    const second = deserializeScene(serializeScene(first));
+    expect(second).toEqual(first);
+    expect(migrateSceneV1ToV2(input)).toEqual(migrateSceneV1ToV2(input));
   });
 });
 
@@ -97,7 +170,7 @@ describe('scene geometry and wall helpers', () => {
   it('models open, closed, and locked door semantics', () => {
     const door = (doorState: DoorWall['doorState']): DoorWall => ({
       id: doorState, type: 'door', doorState, start: { x: 0, y: 0 }, end: { x: 1, y: 0 },
-      height: 10, thickness: 1, elevation: 0, revision: 0,
+      height: 10, thickness: 1, elevation: 0, material: 'default', openings: [], revision: 0,
     });
     expect([wallBlocksMovement(door('open')), wallBlocksVision(door('open'))]).toEqual([false, false]);
     expect([wallBlocksMovement(door('closed')), wallBlocksVision(door('locked'))]).toEqual([true, true]);
@@ -113,7 +186,8 @@ describe('scene serialization', () => {
     const scene = createEmptyScene();
     scene.tokens.hero = {
       id: 'hero', assetId: 'hero-asset', position: { x: -10, y: 20 }, size: { width: 2, height: 2 }, rotation: 45,
-      label: 'Hero', ownerId: 'player-1', hpCurrent: 8, hpMaximum: 10, hpHidden: false, z: 3, revision: 4,
+      label: 'Hero', ownerId: 'player-1', hpCurrent: 8, hpMaximum: 10, hpHidden: false, z: 3,
+      movement: createTokenMovementState(), revision: 4,
     };
     const serialized = serializeScene(scene);
     expect(deserializeScene(serialized)).toEqual(scene);

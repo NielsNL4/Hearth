@@ -8,6 +8,8 @@ This is the detailed execution plan for milestone 2. The complete product roadma
 - **REPLACED:** Supabase Realtime Broadcast is no longer used for token previews; authoritative Colyseus room messages mutate synchronized token state.
 - **REPLACED:** browser-to-Postgres RPCs no longer mutate tactical state; authenticated Colyseus command handlers validate, persist, and mutate it.
 - **REPLACED:** walls are not deferred generic records; an empty typed 2D wall collection enters the scene and Colyseus schemas now.
+- **REPLACED:** encounter movement is not an unrestricted drag-only transform; Phase 1 establishes PathFinding.js grid routing and server-authoritative destination/cost validation, while drag remains setup input.
+- **REPLACED:** movement blockers are not copied into a separate obstacle grid; path traversal derives blocked cell edges directly from typed wall segments and door state.
 
 ## Goal
 
@@ -17,12 +19,13 @@ Deliver the first playable tactical table:
 - Pan and zoom.
 - Adjustable square grid and grid snapping.
 - Token image uploads and a reusable token palette.
-- Token placement, movement, resizing, rotation, labels, and ownership.
+- Token placement, setup transforms, resizing, rotation, labels, and ownership.
 - DM override plus a `players can move all tokens` room setting.
 - Realtime drag previews and authoritative final positions.
 - Persistent room state across reloads and reconnects.
 - Self-hosted Colyseus room authority with automatic binary state deltas.
-- Typed wall foundations for later movement, fog, lighting, and 3D behavior.
+- Typed wall foundations consumed immediately by movement and later by fog, lighting, and 3D behavior.
+- A system-neutral grid-movement contract, PathFinding.js adapter, reachable-cell calculation, and authoritative movement-budget validation ready for later click-to-move presentation.
 
 Fog, drawings, measurement, pings, and initiative remain the next milestone.
 
@@ -43,6 +46,9 @@ Fog, drawings, measurement, pings, and initiative remain the next milestone.
 | Persistence | Colyseus server checkpoints snapshots and events to Supabase Postgres |
 | Reconnection | Colyseus automatic reconnect plus stored-token manual reconnect |
 | Conflict handling | Server-serialized handlers, command idempotency, and per-token revisions |
+| Pathfinding | `pathfinding` (PathFinding.js) A* behind a shared movement adapter |
+| Path authority | Client previews locally; Colyseus recomputes the route and cost from the requested destination |
+| Movement budget | System-neutral allowance/spend state; initiative and character speed integrate in later milestones |
 
 Supabase Storage is not selected because its Free plan currently has a 50 MB per-file ceiling. A single giant image would also exceed practical browser and GPU texture limits. Tiling solves both issues.
 
@@ -100,13 +106,24 @@ interface SceneWall {
   elevation: number;
   revision: number;
 }
+
+interface SceneTokenMovement {
+  allowanceCells: number | null;
+  spentCells: number;
+  activePath: Array<{ column: number; row: number }>;
+  pathCostCells: number;
+  pathStartedAtServerMs: number | null;
+  millisecondsPerCell: number;
+  status: 'idle' | 'moving' | 'interrupted';
+  revision: number;
+}
 ```
 
-Each token stores an asset ID, world position, dimensions, rotation, label, owner, HP fields, visibility, stacking order, and revision. Provider URLs, signed URLs, textures, cameras, Colyseus objects, and Three.js objects remain outside persisted scene data.
+Each token stores an asset ID, world position, dimensions, rotation, label, owner, HP fields, visibility, stacking order, movement allowance/spend/path state, and revision. Provider URLs, signed URLs, textures, cameras, Colyseus objects, PathFinding.js nodes, and Three.js objects remain outside persisted scene data.
 
 Existing milestone 1 `SceneV1` records remain readable through an explicit, tested `SceneV1 -> SceneV2` migration. The database migration backfills existing rooms with empty typed walls and versioned empty fog/initiative state rather than silently changing the meaning of version 1.
 
-Wall behavior is centralized even though editing and collision ship later:
+Wall behavior is centralized even though wall editing and sight collision ship later. Movement traversal consumes it in this milestone:
 
 | Type/state | Blocks sight | Blocks movement |
 | --- | --- | --- |
@@ -116,6 +133,26 @@ Wall behavior is centralized even though editing and collision ship later:
 | `door/open` | No | No |
 | `door/closed` | Yes | Yes |
 | `door/locked` | Yes | Yes |
+
+Pathfinding blocks crossings through `blocking`, `ethereal`, and closed/locked `door` segments. `terrain` and open doors remain traversable. Canonical segments become neighbor-edge restrictions through an adapter; no persisted obstacle grid is added. The later shorthand that grouped `ethereal` with sight blockers conflicts with this table, so the table remains authoritative pending explicit confirmation.
+
+### Grid Movement Foundation
+
+- Pin `pathfinding` after a compatibility test for deterministic Node/browser A*, license, maintenance status, and custom neighbor behavior.
+- Convert scene grid cells to transient nodes and typed walls to blocked neighbor edges.
+- Support reachable-cell cost maps and predecessor paths within a remaining allowance.
+- Define one shared diagonal/cost policy and deterministic tie breaking for client previews and server validation.
+- Account for token footprint, occupied cells, corner clipping, off-grid staging, and door/wall revision invalidation.
+- Keep allowance units system-neutral. Before characters exist, `null` means setup/unlimited and a DM may configure a manual cell allowance.
+- Never trust a submitted route or cost: clients send a destination; Colyseus reconstructs A*, validates allowance and revisions, and returns the accepted route.
+- Preserve drag for scene setup. Once budgeted encounter movement is active, drag release is only another destination input and cannot bypass path validation.
+- Store accepted paths exclusively as integer grid coordinates; renderers derive world-space cell centers and never persist camera/screen coordinates in a path.
+- Add a monotonic room `navigationRevision`. Increment it for grid changes, movement-blocking wall/door changes, occupancy-policy changes, and relevant token-footprint changes; destination commands carry the expected revision.
+- Persist the final position immediately together with path cost, server epoch start time, milliseconds per cost unit, and `idle`/`moving`/`interrupted` status. Reconnect derives playback progress from server time, snaps completed paths to the final position, and replaces interrupted paths by movement revision.
+
+### Extension Readiness
+
+Milestone 2 does not ship remote plug-in installation, but it establishes the Owlbear-style foundation: namespaced scene extensions, typed committed-event subscriptions, built-in module registration, toolbar/panel capability contracts, and a future sandboxed iframe manifest envelope. Core movement and authorization remain non-replaceable host capabilities. Milestone 3's initiative tracker is the first built-in consumer used to validate registration and disable/remove behavior; iframe activation remains deferred until that API is proven.
 
 ## Colyseus Multiplayer Service
 
@@ -127,6 +164,7 @@ One persisted room maps to one active Colyseus room. The multiplayer service wil
 - Load the latest Postgres room snapshot in `onCreate`.
 - Convert renderer-independent DTOs into Colyseus Schema classes.
 - Synchronize members, map/grid, tokens with default HP fields, room permissions, typed walls, versioned empty fog state, and versioned empty initiative state.
+- Synchronize token movement allowance, spent cells, accepted active path, path start time, and movement revision even before the complete click-to-move UI activates.
 - Use per-client State Views for DM-only or player-specific fields as those fields activate.
 - Validate all client messages and derive the actor from `client.auth`.
 - Persist final actions and events before acknowledging success.
@@ -193,6 +231,7 @@ It will introduce:
 - Member token uploads.
 - DM-only ownership assignment and token deletion.
 - Player transform permission for owned tokens or when room-wide movement is enabled.
+- Atomic token destination, accepted path, path cost, and movement-budget persistence.
 
 Direct browser writes to rooms, assets, tokens, or events remain prohibited.
 
@@ -207,6 +246,7 @@ Implement typed Colyseus room messages and matching server handlers:
 - `token.create`
 - `token.transform.preview`
 - `token.transform.commit`
+- `token.move.commit`
 - `token.details.update`
 - `token.delete`
 
@@ -224,6 +264,8 @@ Every user command will:
 - Return a typed acknowledgement with the command and entity revision.
 
 Token transform commands include the expected token revision. This permits concurrent changes to different tokens while rejecting stale changes to the same token.
+
+`token.move.commit` contains the grid destination plus expected token, monotonic navigation, and movement revisions. The server derives the actor, rebuilds the route with the shared PathFinding.js adapter, rejects blocked or over-budget destinations, and atomically persists the resulting position, accepted grid path, cost, playback timing, and remaining allowance. Client-supplied path arrays or costs are diagnostic only and never authoritative.
 
 ## Renderer
 
@@ -249,8 +291,9 @@ Controls will include:
 - Grid visibility, size, and X/Y offset controls.
 - Selection handles for moving, resizing, and rotating tokens.
 - Inspector controls as keyboard-accessible alternatives.
+- A reusable reachable-cell/path projection contract. Milestone 2 may expose development diagnostics, milestone 3 connects budgets to turns, and milestone 9 activates the player-facing overlay after milestone 4 provides immersive rendering.
 
-The rendering package consumes the shared scene contract. It does not own game state, permissions, persistence, Colyseus calls, or Supabase calls. A future perspective renderer can consume the same scene data.
+The rendering package consumes the shared scene contract. It does not own game state, permissions, persistence, Colyseus calls, or Supabase calls. Milestone 4's overview and immersive perspective cameras consume the same scene and accepted movement paths.
 
 ## Token Behavior
 
@@ -264,6 +307,8 @@ The rendering package consumes the shared scene contract. It does not own game s
 - When shared movement is enabled, players can transform all tokens.
 - Ownership changes and deletion remain DM-only.
 - Live Schema updates never bypass server-side permission checks.
+- Free drag transforms are valid for setup/unlimited movement. During budgeted movement, click, keyboard selection, and drag all resolve to the same server-validated destination command.
+- The client may immediately highlight reachable cells and a candidate path, but authoritative route, cost, position, and budget always come back through Colyseus state.
 
 ## Synchronization
 
@@ -290,6 +335,15 @@ Final state:
 - Rely on Colyseus full-state synchronization after reconnect.
 - Rejoin from the durable Postgres snapshot if the reconnect seat expires.
 
+Budgeted destination movement:
+
+- Calculate reachable cells and candidate paths locally for responsiveness.
+- Send one `token.move.commit` with destination, command ID, and expected revisions.
+- Recalculate A* and path cost server-side against current walls, doors, occupancy, footprint, and allowance.
+- Persist accepted path playback data and movement spend before acknowledgement.
+- Reject forged paths, understated cost, stale wall graphs, corner clipping, and destinations outside allowance.
+- On reconnect, resume or settle from server-owned path timing; never continue an orphaned client animation.
+
 The active Colyseus room is the live authority; its committed Postgres snapshot is the restart/resume authority. Client state, pointer previews, and payload actor IDs never grant permissions or prove ownership.
 
 ## Expected Files and Modules
@@ -304,9 +358,11 @@ The active Colyseus room is the live authority; its committed Postgres snapshot 
 | `infra/docker-compose.yml` | MinIO and asset-service development infrastructure |
 | `packages/domain` | Asset and tactical command contracts |
 | `packages/scene` | Scene schemas, migration, coordinates, snapping, and hit testing |
+| `packages/movement` | PathFinding.js adapter, wall-edge constraints, reachability, footprints, and path costs |
 | `packages/room-schema` | Colyseus Schema classes and persisted DTO converters |
 | `packages/rendering` | Three.js tactical renderer abstraction |
 | `packages/sync` | Colyseus client connection plus Supabase lobby adapters |
+| `packages/extensions` | Namespaced scene/event contracts and built-in registration boundary |
 | `supabase/migrations` | Asset metadata, snapshots, events, RLS, and server persistence functions |
 | `tests` | Scene, database, sync, browser, and authorization coverage |
 
@@ -314,21 +370,24 @@ The active Colyseus room is the live authority; its committed Postgres snapshot 
 
 1. Save this plan and create the Jira milestone task if Jira access becomes available.
 2. Add scene schemas, typed empty walls, migration parsing, geometry utilities, and unit tests.
-3. Add Colyseus Schema classes and DTO conversion tests.
-4. Add the Colyseus service, Supabase authentication, room authorization, persistence, and reconnection.
-5. Migrate lobby presence from Supabase Realtime to Colyseus.
-6. Add MinIO Docker Compose infrastructure and the asset API.
-7. Add asset metadata, snapshots, events, server-only persistence functions, and database tests.
-8. Refactor the sync package into a Colyseus room client and Supabase lobby repository.
-9. Add the fullscreen tactical route and renderer abstraction.
-10. Implement tiled map loading, camera navigation, and recovery states.
-11. Implement map upload progress, processing status, and map selection.
-12. Implement grid controls and snapping.
-13. Implement token uploads, palette, creation, labels, ownership, and synchronized HP defaults.
-14. Implement drag, resize, rotation, off-map placement, and keyboard controls.
-15. Add server-authoritative previews, durable commits, revision conflicts, and reconnect recovery.
-16. Add Playwright, Colyseus, multi-user, and responsive interaction tests.
-17. Update setup, security, storage, and acceptance documentation.
+3. Add the PathFinding.js adapter, wall-edge traversal, reachable-cell calculation, system-neutral movement state, and deterministic tests.
+4. Add Colyseus Schema classes, including movement state, and DTO conversion tests.
+5. Add the Colyseus service, Supabase authentication, room authorization, persistence, and reconnection.
+6. Add authoritative destination/path-cost validation and atomic movement-budget commits.
+7. Migrate lobby presence from Supabase Realtime to Colyseus.
+8. Add MinIO Docker Compose infrastructure and the asset API.
+9. Add asset metadata, snapshots, events, server-only persistence functions, and database tests.
+10. Refactor the sync package into a Colyseus room client and Supabase lobby repository.
+11. Add the fullscreen tactical route and renderer abstraction.
+12. Implement tiled map loading, camera navigation, and recovery states.
+13. Implement map upload progress, processing status, and map selection.
+14. Implement grid controls, snapping, and reusable reachable-cell/path projection data for later tactical and immersive overlays.
+15. Implement token uploads, palette, creation, labels, ownership, synchronized HP defaults, and movement defaults.
+16. Implement setup drag, resize, rotation, off-map placement, and keyboard controls.
+17. Add server-authoritative previews, durable transform/movement commits, revision conflicts, and reconnect recovery.
+18. Establish namespaced extension/event contracts and built-in registration without enabling third-party installation.
+19. Add Playwright, Colyseus, multi-user, movement-security, and responsive interaction tests.
+20. Update setup, security, storage, and acceptance documentation.
 
 ## Testing
 
@@ -343,6 +402,8 @@ The active Colyseus room is the live authority; its committed Postgres snapshot 
 - Snap correctly around positive and negative coordinates.
 - Hit-test rotated tokens.
 - Convert persisted scene DTOs to/from Colyseus Schema without data loss.
+- Produce deterministic reachable-cell sets and paths for positive/negative grids, wall-edge restrictions, door states, occupancy, and multi-cell tokens.
+- Validate extension manifests, namespaced scene keys, committed-event subscriptions, capabilities, built-in registration, and clean disable/removal behavior.
 
 ### Database Tests
 
@@ -355,6 +416,7 @@ The active Colyseus room is the live authority; its committed Postgres snapshot 
 - Reject stale updates to the same token.
 - Update scene, revision, and event atomically.
 - Reject invalid coordinates, sizes, rotations, labels, and asset references.
+- Update accepted path, position, movement spend, revision, snapshot, and event atomically.
 - Enforce server-only snapshot/event persistence and outsider denial.
 
 ### Colyseus Tests
@@ -368,6 +430,8 @@ The active Colyseus room is the live authority; its committed Postgres snapshot 
 - Reconnect automatically while the seat is held.
 - Reconnect manually after reload with the stored token.
 - Rejoin from Postgres after seat expiry or server restart.
+- Recompute paths server-side and reject forged routes, understated costs, blocked destinations, stale navigation/movement revisions, and over-budget movement.
+- Reset or preserve movement allowance according to explicit setup/turn lifecycle without depending on 5e code.
 
 ### Asset Service Tests
 
@@ -392,6 +456,7 @@ The active Colyseus room is the live authority; its committed Postgres snapshot 
 - Reuse command IDs after ambiguous failures.
 - Restore final state after reload.
 - Keep controls usable on mobile viewports.
+- Through a development harness, submit destinations and reconcile server routes without making the final player-facing click-to-move UI a milestone 2 release blocker.
 
 ### Connected Acceptance Test
 
@@ -407,6 +472,8 @@ Use two authenticated browser profiles against Supabase, Colyseus, MinIO, and th
 8. A reload manually reconnects with the saved token; an expired seat rejoins from Postgres.
 9. Moving an unowned token is rejected by the Colyseus server.
 10. A nonmember cannot join the Colyseus room or read scene data, assets, or tiles.
+11. A client that submits a forged, blocked, stale, or over-budget destination is rejected without changing position or movement spend.
+12. Reconnect during an accepted path restores authoritative playback/final position instead of continuing orphaned client animation.
 
 ## Acceptance Criteria
 
@@ -424,6 +491,9 @@ Use two authenticated browser profiles against Supabase, Colyseus, MinIO, and th
 - Existing milestone 1 room and invitation behavior continues passing.
 - Every room includes the typed empty wall schema without exposing a wall editor yet.
 - Tokens with HP fields, versioned fog state, and versioned initiative state are represented in server-owned Colyseus Schema classes even before their later editing controls ship.
+- Token movement allowance/spend/path fields and deterministic wall-aware path validation exist in Phase 1 even if full immersive click-to-move presentation activates after milestones 4 and 9.
+- No drag or destination payload can bypass the server's recomputed route, blocker, ownership, revision, or remaining-allowance checks.
+- Extension contracts reject unnamespaced state and unauthorized capabilities; the later initiative built-in can register and be disabled without changing core synchronization code.
 
 ## Verification Commands
 
@@ -444,6 +514,9 @@ The connected two-browser acceptance test additionally verifies MinIO uploads, C
 - Original map retention increases local storage use. Cleanup and retention settings must be documented before public hosting.
 - Frequent preview mutations increase patch traffic. Throttle input, quantize suitable transforms, measure patch bytes, and persist only final transforms.
 - A Colyseus process crash can lose uncommitted previews. Final actions are acknowledged only after persistence; periodic checkpoints bound loss for other mutable state.
+- PathFinding.js represents walkable nodes more directly than segment-edge blockers. The adapter and compatibility fixtures must prove custom neighbor filtering without materializing a second authoritative obstacle grid.
+- Reachability can become expensive on large maps. Bound searches by remaining allowance, cache by grid/wall/door/occupancy revisions, and profile multi-cell tokens before enabling full-map previews.
+- Full immersive click-to-move presentation is not a milestone 2 release blocker. This milestone freezes and verifies the movement authority; milestone 4 adds follow cameras and milestone 9 adds avatar locomotion.
 
 ## Work Tracking
 

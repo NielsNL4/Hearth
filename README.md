@@ -73,7 +73,7 @@ Start MinIO, the asset API, and Colyseus:
 docker compose --env-file infra/.env -f infra/docker-compose.yml up --build
 ```
 
-MinIO listens on ports 9000/9001, the asset API on 3100, and Colyseus on 2567.
+MinIO listens on ports 9000/9001, the asset API on 3100, and Colyseus on 2567. The asset service uses MinIO's internal Docker endpoint for server operations and `S3_PUBLIC_ENDPOINT` (default `http://localhost:9000`) for browser signed upload/download URLs; set it to the browser-reachable object-storage origin when running elsewhere.
 
 ### 5. Set frontend environment variables
 
@@ -95,6 +95,8 @@ npm run dev
 ```
 
 Open **http://localhost:5173**. Restart Vite after changing environment variables. Without valid configuration, the app displays a setup screen rather than fake rooms or a broken login form.
+
+In a development build, DMs can select **Load development set** on the tactical table. This converts the bundled Training Ruins map and three placeholder token SVGs to PNG and sends them through the normal authenticated MinIO processing and Colyseus command flow; it does not create client-only scene state or bypass authorization.
 
 ## Optional: fully local Supabase
 
@@ -154,6 +156,7 @@ apps/web/src/
 apps/assets/            Fastify asset API and image processing
 apps/multiplayer/       Authoritative Colyseus room service
 packages/domain/src/    Command contracts and input validation
+packages/movement/src/  PathFinding.js adapter and navigation rules
 packages/room-schema/   Colyseus Schema and DTO conversion
 packages/scene/src/     Serializable SceneV1/V2 contracts and geometry
 packages/sync/src/      Supabase lobby adapter and Colyseus client lifecycle
@@ -174,11 +177,11 @@ tests/                  PostgreSQL integration and browser contract tests
 - Durable events contain only room-safe activity data. Invitation codes are not published in events.
 - Private room channels carry transient presence only. Presence is advisory and can never grant permissions or prove identity. Saved memberships are the authority.
 - Durable roster/activity reads happen on entry, presence sync, network recovery, and every 15 seconds. This intentionally small development-first implementation does not yet broadcast durable map commands.
-- The scene model stores world data, never Three.js objects or camera state. Rendering and geometry tools are milestone 2 work. Private DM content must use separately authorized records when added.
+- The scene model stores world data, never Three.js objects or camera state. Tactical rendering, shared fog polygons, owned drawings, movement, and initiative are server-owned foundations; rulers and pings remain transient. Private DM content must use separately authorized records when added.
 
 ## Next implementation boundary
 
-The next milestone can build fog editing, wall tools, initiative UI, and rules integration on the SceneV2 and authoritative-room foundations. The 5e edition and exact rules-automation behaviors remain an explicit decision gate; Open5e v2 is the selected content source, not the rules engine.
+The next milestone can start the 3D building and camera-overview foundation, with 2D wall editing as its canonical geometry input. Per-player fog remains disabled until Colyseus State Views prevent unauthorized geometry disclosure. The 5e edition and exact rules-automation behaviors remain an explicit decision gate; Open5e v2 is the selected content source, not the rules engine.
 
 For frontend hosting later, serve `apps/web/dist` and rewrite application paths (`/rooms/*`, `/join/*`, `/auth/callback`) to `index.html`. Update the Supabase Site URL and callback allowlist for that origin.
 

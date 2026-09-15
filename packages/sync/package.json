@@ -8,6 +8,6 @@
     "@hearth/domain": "*",
     "@hearth/room-schema": "*",
     "@supabase/supabase-js": "^2.99.0",
-    "colyseus.js": "^0.16.22"
+    "@colyseus/sdk": "^0.18.1"
   }
 }

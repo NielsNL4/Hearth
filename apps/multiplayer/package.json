@@ -7,14 +7,17 @@
   "scripts": {
     "dev": "tsx watch src/main.ts",
     "start": "tsx src/main.ts",
+    "smoke:m4": "tsx scripts/milestone4-smoke.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@colyseus/core": "^0.18.12",
+    "@colyseus/sdk": "^0.18.2",
     "@colyseus/schema": "^5.0.27",
     "@colyseus/tools": "^0.18.3",
     "@colyseus/ws-transport": "^0.18.2",
     "@hearth/domain": "*",
+    "@hearth/movement": "*",
     "@hearth/room-schema": "*",
     "@hearth/scene": "*",
     "@supabase/supabase-js": "^2.99.0",

@@ -1,3 +1,4 @@
+import { createServer } from 'node:http';
 import { describe, expect, it, vi } from 'vitest';
 import { authenticate, authorizeAsset, bearerToken } from '../apps/assets/src/authorization.js';
 import { loadConfig } from '../apps/assets/src/config.js';
@@ -5,6 +6,7 @@ import {
   RequestError, assertCanonicalAsset, assertRequestedOutputKeys, validateImageMetadata, validateUpload,
 } from '../apps/assets/src/policy.js';
 import { buildManifest, buildMapOutputs, buildTokenOutputs } from '../apps/assets/src/plan.js';
+import { S3ObjectStore } from '../apps/assets/src/storage.js';
 import type { AssetRepository, RoomAsset } from '../apps/assets/src/types.js';
 
 const roomId = '00000000-0000-4000-8000-000000000001';
@@ -119,12 +121,83 @@ describe('environment validation', () => {
   };
 
   it('accepts exact origins and bounded settings', () => {
-    expect(loadConfig(valid)).toMatchObject({ corsOrigins: ['https://table.example.com', 'http://localhost:3000'], processingConcurrency: 2 });
+    expect(loadConfig(valid)).toMatchObject({
+      corsOrigins: ['https://table.example.com', 'http://localhost:3000'],
+      processingConcurrency: 2,
+      s3PublicEndpoint: 'http://minio:9000',
+    });
+    expect(loadConfig({ ...valid, S3_PUBLIC_ENDPOINT: 'http://localhost:9000/' })).toMatchObject({
+      s3PublicEndpoint: 'http://localhost:9000',
+    });
   });
 
   it('rejects wildcard CORS, malformed booleans, and unsafe concurrency', () => {
     expect(() => loadConfig({ ...valid, CORS_ORIGINS: '*' })).toThrow(/cannot contain/);
     expect(() => loadConfig({ ...valid, REMOVE_TOKEN_SOURCE: 'yes' })).toThrow(/true or false/);
     expect(() => loadConfig({ ...valid, PROCESSING_CONCURRENCY: '100' })).toThrow(/between 1 and 16/);
+  });
+});
+
+describe('S3 endpoint separation', () => {
+  it('uses the public endpoint only for signed URLs and the internal endpoint for storage operations', async () => {
+    const valid = {
+      CORS_ORIGINS: 'http://localhost:5175',
+      SUPABASE_URL: 'https://project.supabase.co',
+      SUPABASE_SERVICE_ROLE_KEY: 'server-only-key',
+      S3_ENDPOINT: 'http://minio:9000',
+      S3_ACCESS_KEY: 'access',
+      S3_SECRET_KEY: 'secret',
+      S3_BUCKET: 'private',
+      INTERNAL_JOB_SECRET: 'job-secret',
+    };
+    const internalRequests: string[] = [];
+    const internalServer = createServer((request, response) => {
+      internalRequests.push(`${request.method} ${request.url}`);
+      request.resume();
+      request.on('end', () => {
+        if (request.method === 'HEAD') {
+          response.setHeader('Content-Length', '4');
+          response.setHeader('Content-Type', 'text/plain');
+        } else if (request.method === 'GET') {
+          response.setHeader('Content-Type', 'text/plain');
+          response.setHeader('Content-Length', '4');
+        }
+        response.end(request.method === 'GET' ? 'test' : undefined);
+      });
+    });
+    const publicServer = createServer((_request, response) => response.end());
+
+    const listen = async (server: ReturnType<typeof createServer>): Promise<string> => {
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('Test server did not receive an address');
+      return `http://127.0.0.1:${address.port}`;
+    };
+    const close = async (server: ReturnType<typeof createServer>): Promise<void> => {
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    };
+
+    const internalEndpoint = await listen(internalServer);
+    const publicEndpoint = await listen(publicServer);
+    try {
+      const config = loadConfig({ ...valid, S3_ENDPOINT: internalEndpoint, S3_PUBLIC_ENDPOINT: publicEndpoint });
+      const store = new S3ObjectStore(config);
+
+      const upload = await store.createUpload('diagnostic', 'text/plain', 4, 60);
+      expect(new URL(upload.url).origin).toBe(publicEndpoint);
+      expect(new URL(await store.signDownload('diagnostic', 60)).origin).toBe(publicEndpoint);
+
+      await store.put('diagnostic', 'test', 'text/plain');
+      await expect(store.head('diagnostic')).resolves.toMatchObject({ bytes: 4, contentType: 'text/plain' });
+      await expect(store.getText('diagnostic')).resolves.toBe('test');
+      expect(internalRequests).toEqual(expect.arrayContaining([
+        expect.stringMatching(/^PUT \/private\/diagnostic/),
+        expect.stringMatching(/^HEAD \/private\/diagnostic/),
+        expect.stringMatching(/^GET \/private\/diagnostic/),
+      ]));
+    } finally {
+      await close(publicServer);
+      await close(internalServer);
+    }
   });
 });

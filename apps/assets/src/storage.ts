@@ -12,16 +12,18 @@ import type { ObjectStore } from './types.js';
 
 export class S3ObjectStore implements ObjectStore {
   private readonly client: S3Client;
+  private readonly signingClient: S3Client;
   private readonly bucket: string;
 
   constructor(config: Config) {
     this.bucket = config.s3Bucket;
-    this.client = new S3Client({
-      endpoint: config.s3Endpoint,
+    const options = {
       region: config.s3Region,
       forcePathStyle: config.s3ForcePathStyle,
       credentials: { accessKeyId: config.s3AccessKey, secretAccessKey: config.s3SecretKey },
-    });
+    };
+    this.client = new S3Client({ ...options, endpoint: config.s3Endpoint });
+    this.signingClient = new S3Client({ ...options, endpoint: config.s3PublicEndpoint });
   }
 
   async ensurePrivateBucket(): Promise<void> {
@@ -36,7 +38,7 @@ export class S3ObjectStore implements ObjectStore {
   }
 
   async createUpload(key: string, contentType: string, expectedBytes: number, expiresSeconds: number) {
-    const result = await createPresignedPost(this.client, {
+    const result = await createPresignedPost(this.signingClient, {
       Bucket: this.bucket,
       Key: key,
       Expires: expiresSeconds,
@@ -72,6 +74,6 @@ export class S3ObjectStore implements ObjectStore {
   }
 
   async signDownload(key: string, expiresSeconds: number): Promise<string> {
-    return getSignedUrl(this.client, new GetObjectCommand({ Bucket: this.bucket, Key: key }), { expiresIn: expiresSeconds });
+    return getSignedUrl(this.signingClient, new GetObjectCommand({ Bucket: this.bucket, Key: key }), { expiresIn: expiresSeconds });
   }
 }

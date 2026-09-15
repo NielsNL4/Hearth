@@ -53,6 +53,7 @@ export async function uploadAsset(
   reservation: AssetReservation,
   file: File,
   onProgress: (progress: number) => void,
+  onProcessing?: () => void,
 ) {
   const upload = await request<{ url: string; fields: Record<string, string> }>(session, `/v1/assets/${reservation.id}/upload`, {
     method: 'POST', body: JSON.stringify({ contentType: file.type, bytes: file.size }),
@@ -68,6 +69,7 @@ export async function uploadAsset(
     xhr.onload = () => xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error(`Upload failed (${xhr.status}).`));
     xhr.send(form);
   });
+  onProcessing?.();
   await request(session, `/v1/assets/${reservation.id}/process`, { method: 'POST', body: '{}' });
 }
 

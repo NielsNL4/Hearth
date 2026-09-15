@@ -12,6 +12,8 @@ Every item marked **REPLACED** supersedes an earlier assumption in this plan.
 - **REPLACED:** custom GLB/glTF upload as the first avatar route -> Ready Player Me Avatar Creator and its returned `.glb` URL.
 - **REPLACED:** a generator designed from scratch -> `dungeon-generator` by domasx2 behind a canonical-scene adapter and compatibility tests.
 - **REPLACED:** an internal-only module registry -> a manifest, sandboxed iframe, toolbar action, and typed host-API extension model.
+- **REPLACED:** unrestricted drag-only encounter movement -> a shared grid-movement model using PathFinding.js A*, reachable-cell previews, and server-authoritative path-cost validation; drag remains for setup and compatible destination input.
+- **REPLACED:** a single generic 3D orbit camera -> separate tactical 2D, 3D overview, and immersive token-follow camera modes over the same Three.js scene.
 
 ## 1. Product Goal
 
@@ -46,6 +48,8 @@ The application must preserve these constraints from the first release:
 | Token upload target | At least 20 MB; use a 25 MB milestone limit |
 | Player uploads | Room members may upload token images; only DMs may upload maps |
 | Off-map staging | Tokens may be placed outside the map |
+| Grid movement | `pathfinding` (PathFinding.js) behind a system-neutral adapter; Colyseus recomputes and validates paths and movement cost |
+| Camera modes | Orthographic tactical 2D plus perspective overview and immersive token-follow modes over one scene |
 | Rules | Shared rolls and combat basics are desired |
 | Rules edition | Unresolved; automation waits for a 2014 versus 2024 decision |
 | Rules content | Open5e API v2, filtered by approved source documents and cached per campaign/session |
@@ -85,6 +89,13 @@ Phase mapping:
 - Phase 2c is milestone 7.
 - Phase 3 spans milestones 8 through 11; milestone 12 remains future work.
 
+Click-to-move is deliberately split across phases without splitting its authority model:
+
+- **Phase 1 / milestone 2:** canonical grid movement, PathFinding.js adapter, wall-edge traversal, server-owned allowance/spend/path state, and authoritative destination validation.
+- **Phase 1 / milestone 3:** initiative resets and remaining-movement state integrate with the existing model; developer diagnostics may expose reachability without making the full feature a release blocker.
+- **Phase 2a / milestone 4:** the shared 3D scene adds overview and immersive token-follow cameras plus wall-aware visual traversal.
+- **Phase 3 / milestone 9:** Ready Player Me idle/walk animation completes immersive path presentation; flat-token tweening remains the permanent fallback.
+
 The typed wall contract belongs to Phase 1. Because milestone 1 was implemented before this decision, the first Phase 1 schema migration that can add it is milestone 2; milestone 3 and all later work must consume that contract rather than introduce another wall model.
 
 ## 4. Repository Architecture
@@ -101,6 +112,7 @@ packages/
   scene/                 Versioned renderer-independent scene contracts
   room-schema/            Shared Colyseus Schema classes and DTO conversion
   geometry/              Polygons, rays, intersections, visibility, measurement
+  movement/              PathFinding.js adapter, wall-edge traversal, reachability, and path-cost rules
   rendering/             Renderer interfaces and shared render resources
   rendering-tactical/    Orthographic Three.js renderer
   rendering-diorama/     Perspective Three.js renderer
@@ -168,6 +180,17 @@ interface SceneWall {
   elevation: number;
   revision: number;
 }
+
+interface SceneTokenMovement {
+  allowanceCells: number | null;
+  spentCells: number;
+  activePath: GridPoint[];
+  pathCostCells: number;
+  pathStartedAtServerMs: number | null;
+  millisecondsPerCell: number;
+  status: 'idle' | 'moving' | 'interrupted';
+  revision: number;
+}
 ```
 
 Rules:
@@ -182,6 +205,7 @@ Rules:
 - Generators produce valid scene fragments accepted by the manual editor.
 - Walls are always pure 2D points plus line segments; generated meshes are derived output.
 - `doorState` is present only for `door` segments and is validated server-side.
+- Token movement state is system-neutral and grid-based. A manually configured allowance is available before character rules exist; a future rules adapter may supply speed without changing the movement contract.
 
 Wall behavior is defined centrally and reused by movement, visibility, fog, and 3D conversion:
 
@@ -194,7 +218,9 @@ Wall behavior is defined centrally and reused by movement, visibility, fog, and 
 | `door/closed` | Yes | Yes |
 | `door/locked` | Yes | Yes |
 
-**REPLACED:** walls are no longer deferred generic records. The typed wall fields enter the next scene migration even though wall editing, collision, line of sight, and extrusion are enabled incrementally in later milestones. Existing milestone 1 scenes are backfilled with an empty typed wall collection.
+Pathfinding consumes this exact table: `blocking`, `ethereal`, and closed/locked doors prevent crossing their segment; `terrain` and open doors do not. It never maintains a second obstacle grid that can drift from scene walls.
+
+**REPLACED:** walls are no longer deferred generic records. Typed fields and movement-edge consumption enter milestone 2; wall editing, line of sight, and extrusion activate incrementally later. Existing milestone 1 scenes are backfilled with an empty typed wall collection.
 
 ### 5.2 Coordinate and Geometry Model
 
@@ -219,6 +245,19 @@ Shared geometry covers:
 - Wall-type behavior lookup for sight and movement.
 - Deterministic conversion from a wall segment to a rectangular `THREE.Shape` input.
 
+Grid movement is implemented through a provider-neutral movement adapter backed initially by the `pathfinding` npm package (PathFinding.js):
+
+- Scene grid cells become PathFinding.js nodes, but canonical wall segments remain edge constraints rather than duplicated blocked-cell data.
+- A neighbor is traversable only when moving between the two cells does not cross a movement-blocking wall segment or closed/locked door.
+- Door-state, wall-revision, occupancy, or token-footprint changes invalidate cached reachability results.
+- Client and server share deterministic diagonal and cost configuration, but the server always rebuilds the path and cost from the destination instead of trusting a submitted client path.
+- Reachability calculates every destination within the authoritative remaining allowance and returns predecessor/cost data for tactical highlighting.
+- Large tokens evaluate every occupied grid cell and cannot clip corners or cross a blocked edge.
+- Off-grid staged tokens may be positioned by setup transforms but must enter the encounter grid through a server-approved destination.
+- Accepted paths are integer `GridPoint[]` cell coordinates. Rendering converts each cell to its world-space center; path state never mixes screen or world coordinates.
+- Room state owns a monotonic `navigationRevision`, incremented whenever grid settings, movement-blocking wall/door state, occupancy policy inputs, or relevant token footprints change. Destination commands include the expected navigation revision.
+- A successful move persists the final world position immediately with `activePath`, path cost, server epoch start time, milliseconds per cost unit, and movement status. Clients animate this authoritative path against server time; reconnects past its calculated end render the final position, and replacement/interruption increments the movement revision.
+
 The 2D and 3D renderers may optimize geometry independently, but optimized objects are derived caches and never authoritative data. SVG may be used as an editor/import interchange format, but it is never the canonical scene model.
 
 ### 5.3 Colyseus Room State
@@ -231,6 +270,7 @@ Each persisted room maps to one Colyseus room session. On room creation or activ
 - Map/grid references and room permissions.
 - Tokens, ownership, transforms, labels, HP, and visibility flags.
 - Typed walls and door state.
+- Monotonic navigation revision plus token movement allowance, spend, accepted grid path, timing, and status.
 - Fog geometry and visibility state.
 - Initiative order, active turn, and round.
 - Drawings, templates, lights, and effects as their milestones activate.
@@ -257,6 +297,14 @@ interface TokenState {
   hpCurrent: number;
   hpMaximum: number;
   hpHidden: boolean;
+  movementAllowanceCells: number;
+  movementSpentCells: number;
+  movementUnlimited: boolean;
+  activePath: ArraySchema<GridPointState>;
+  pathStartedAtServerMs: number;
+  pathCostCells: number;
+  millisecondsPerCell: number;
+  movementStatus: 'idle' | 'moving' | 'interrupted';
   revision: number;
 }
 
@@ -275,7 +323,7 @@ interface InitiativeState {
 }
 ```
 
-Milestone 2 initializes and synchronizes these fields with empty fog/initiative collections and token HP defaults. Milestone 3 adds fog/initiative editing commands; milestone 6 adds encounter-aware HP controls. This is authoritative state with staged behavior, not an untyped placeholder.
+Milestone 2 initializes and synchronizes these fields with empty fog/initiative collections, token HP defaults, and system-neutral movement defaults. A nullable/unlimited movement allowance supports setup before turn tracking exists. Milestone 3 connects allowance reset and remaining movement to initiative; milestone 6 adds encounter-aware HP controls; milestone 8 may derive allowance from character speed. This is authoritative state with staged behavior, not an untyped placeholder.
 
 Room lifecycle:
 
@@ -318,8 +366,10 @@ Command requirements:
 - Relevant modules may consume committed events through typed subscribers.
 - Postgres credentials and privileged persistence functions are server-only.
 - Existing room-creation and invitation RPCs may remain in Supabase; in-room game mutations move to Colyseus handlers.
+- `token.move.commit` contains a grid destination, expected token/navigation/movement revisions, and command UUID, not an authoritative client path. The server rebuilds A*, checks ownership, blockers, occupancy, and remaining allowance, then atomically persists the final position, active path, timing, cost, and budget.
+- Reachable-cell and path previews are disposable client projections. A server rejection or different authoritative path replaces them immediately.
 
-Continuous token transforms may update bounded Schema preview fields so clients receive compressed deltas. Final pointer release performs the durable command. Pings, one-shot effects, and extension notifications use typed Colyseus room messages rather than persistent state.
+Continuous token transforms may update bounded Schema preview fields so clients receive compressed deltas. Final pointer release performs the durable setup-transform command. In budgeted encounter mode, click or drag supplies only a destination to `token.move.commit`; neither interaction can bypass path or speed validation. Pings, one-shot effects, and extension notifications use typed Colyseus room messages rather than persistent state.
 
 ### 5.5 Reconciliation and Persistence
 
@@ -386,6 +436,8 @@ Module rules:
 - Iframes never receive raw Supabase tokens, Colyseus reconnection tokens, MinIO credentials, or direct database access.
 - The host SDK exposes scoped reads, commands, selection, toolbar actions, and subscriptions.
 - Remote third-party extension installation remains disabled in the MVP; only the manifest and host contracts are established.
+- Milestone 2 must establish the namespaced scene-extension envelope, typed committed-event subscriber contract, and built-in registration API. The iframe host and third-party installation UI can remain dormant until a later built-in module validates the boundary.
+- Movement authority, pathfinding, and camera-mode contracts are core capabilities because they enforce shared spatial rules and stable renderer switching. Perspective overview/follow renderers remain removable milestone-4 modules; dice, combat tracker, notes, optional render layers, and avatar presentation may consume extension points without owning core movement state.
 
 The dice roller, combat tracker, and notes panel should be the first built-in consumers of these contracts. Building them as first-party extensions validates the API before any third-party installation flow is enabled.
 
@@ -508,7 +560,7 @@ Layers:
 5. Fog and visibility masks.
 6. Tokens and labels.
 7. Selection handles and measurements.
-8. Transient cursors, pings, and drag previews.
+8. Reachable-cell shading, candidate paths, transient cursors, pings, and drag previews.
 
 Requirements:
 
@@ -521,10 +573,12 @@ Requirements:
 - Visible off-map staging area.
 - Local per-room camera persistence.
 - Accessible inspector alternatives for drag, resize, and rotation.
+- Local PathFinding.js previews for reachable, blocked, and over-budget cells, reconciled against the server-approved path and cost.
+- A destination-click interaction that coexists with drag setup. Encounter-mode drag resolves through the same destination command rather than a privileged free transform.
 
-### 8.2 Diorama Renderer
+### 8.2 Diorama and Immersive Renderer
 
-The 3D renderer consumes the same scene with a perspective orbit camera.
+The 3D renderer consumes the same scene with two local perspective camera controllers: overview/orbit and immersive token-follow. Tactical 2D remains a separate orthographic controller, but all modes render projections of the same canonical scene and switch without rewriting scene data.
 
 - Maps and floors become horizontal planes.
 - Wall segments become extruded meshes through `THREE.ExtrudeGeometry`.
@@ -533,8 +587,10 @@ The 3D renderer consumes the same scene with a perspective orbit camera.
 - Ready Player Me GLB avatars replace billboards when available.
 - Lights become Three.js light or shader inputs.
 - Effects register `three.quarks` particle systems or animated meshes.
+- The immersive camera follows the selected or active token from a configurable third-person eye-height offset. Camera smoothing, yaw, pitch, collision avoidance, and reduced-motion behavior remain renderer-local.
+- While a server-approved `activePath` is playing, flat tokens use a linear path tween. Ready Player Me avatars use `AnimationMixer` with idle/walk cross-fades when compatible clips are available, then fall back to the same transform tween.
 
-The DM controls whether players may enter 3D mode. Camera state remains local unless a future guided-camera feature explicitly synchronizes it.
+The DM controls whether players may enter 3D mode. A simple Tactical 2D / Overview 3D / Immersive 3D toggle changes only renderer and camera state. Camera state remains local unless a future guided-camera feature explicitly synchronizes it.
 
 Wall extrusion is a deterministic adapter from canonical 2D scene data:
 
@@ -591,6 +647,8 @@ Deliverables:
 - Token creation, transform, rotation, labels, stacking, and ownership.
 - Owned/shared movement authorization.
 - Binary delta-synchronized drag state and server-authoritative final transforms.
+- Phase 1 grid-movement foundation: pinned PathFinding.js adapter, wall-edge traversal, reachable-cell cost calculation, system-neutral movement allowance state, and server-authoritative destination validation.
+- A durable `token.move.commit` command that atomically updates token position and movement budget; drag cannot bypass it when budgeted encounter movement is active.
 - Durable revisioned token commands persisted by the Colyseus server.
 - Typed wall schema with `blocking`, `terrain`, `ethereal`, and `door` behavior before the wall editor exists.
 
@@ -600,6 +658,7 @@ Release criteria:
 - Reload and reconnect restore identical authoritative state.
 - Unauthorized token movement and asset access fail server-side.
 - A dropped client reconnects to the same Colyseus room state; an expired seat rejoins from the durable Postgres snapshot.
+- Client and server path calculations agree for the selected diagonal/cost policy, while a forged destination, path, wall revision, or movement cost is rejected.
 
 ### Milestone 3: Fog, Drawing, Measurement, Pings, and Initiative
 
@@ -659,6 +718,8 @@ Deliver:
 
 Tokens, fog, initiative, and HP are all first-class server-owned Colyseus Schema state by the end of this milestone. Hidden initiative details and HP use per-client State Views rather than client-side concealment.
 
+Initiative activation also resets the active token's system-neutral movement budget. Full player-facing reachable-cell and destination-click interaction remains scheduled for milestone 9, after milestone 4 supplies the immersive scene/camera; milestone 3 may expose only development diagnostics for validating turn integration.
+
 Release criteria:
 
 - A group can run and resume a complete map-based combat session with manual fog, annotations, measurement, pings, and initiative.
@@ -672,8 +733,8 @@ Deliver as the first optional immersive module.
 - Floors, roofs, doors, and windows.
 - Snap endpoints and detect connected wall topology.
 - Lightweight block-based building tools.
-- Perspective orbit/overview camera.
-- Flat tactical and 3D diorama view switching.
+- Perspective orbit/overview and third-person token-follow camera controllers.
+- Flat tactical, 3D overview, and immersive 3D view switching over one scene.
 - Player access toggle for the 3D view.
 
 Architecture:
@@ -684,14 +745,18 @@ Architecture:
 - Use `SVGLoader` only when SVG paths enter through an editor/import adapter; convert them to `Shape` objects and then run the same extrusion pipeline.
 - Keep extrusion a deterministic, side-effect-free conversion from existing 2D scene data; do not maintain a separate 3D wall source.
 - Keep materials provider-neutral.
+- Reuse Phase 1 pathfinding edge constraints against the now-editable walls. Wall/door revisions invalidate movement previews and cached routes immediately.
 - Treat roofs as visibility-aware structures that can hide automatically in tactical or cutaway views.
 - Run mesh generation in a worker when scenes become complex.
 
 Release criteria:
 
 - A DM can draw a simple multi-room building in 2D and immediately inspect it in 3D without changing scene data formats.
+- Switching camera modes preserves selection and authoritative movement state; the immersive camera can follow a flat fallback token before avatars exist.
 
 ### Milestone 5: Line of Sight and Lighting Foundation
+
+**REPLACED:** movement collision is no longer introduced here. Milestone 2 already establishes wall-aware path traversal for authoritative movement; this milestone adds sight, fog, and lighting consumption of the same behavior table.
 
 Deliver:
 
@@ -882,6 +947,20 @@ Deliver:
 - 3D model attachment to a token.
 - Scale, facing, elevation, animation selection, and fallback image.
 - Flat token image remains authoritative in tactical view unless explicitly configured otherwise.
+- Resolve and validate compatible idle/walk clips, then drive them through Three.js `AnimationMixer` with cross-fades while a server-approved path is active.
+- Match animation playback rate to path movement speed and stop or return to idle when movement completes, is rejected, or is interrupted.
+- Fall back to deterministic linear path tweening for flat tokens, missing clips, incompatible skeletons, reduced-motion mode, or failed model loads.
+
+#### Immersive Click-to-Move Activation
+
+Activate the complete presentation after the Phase 1 movement authority and milestone 4 camera/wall renderer are available:
+
+- Selecting an eligible token highlights all reachable cells within its remaining server-owned allowance.
+- Hover/focus previews the cheapest candidate path and cost; clicking submits only the destination and expected revisions.
+- The server recomputes PathFinding.js A*, persists the accepted path/cost/budget, and Colyseus synchronizes playback state.
+- Tactical 2D animates the token along the accepted path; Immersive 3D follows it with the third-person camera and uses the Ready Player Me walk loop when available.
+- Keyboard and touch users can select a destination from the reachable-cell set without requiring precise pointer drag.
+- Drag remains available for setup and as destination input, but budgeted encounter movement always passes through the same path command.
 
 Security:
 
@@ -896,6 +975,7 @@ Security:
 Release criteria:
 
 - A valid model appears in the 3D view, while unsupported devices and the tactical view retain a functional 2D fallback.
+- Tactical and immersive clients play the same accepted route, enforce the same remaining movement, and recover the active/final path state after reconnect.
 
 ### Milestone 10: Procedural Maps and Dungeons
 
@@ -1001,10 +1081,12 @@ Cover:
 - Persisted DTO to Colyseus Schema conversion in both directions.
 - Coordinate conversion and camera math.
 - Grid snapping and distance rules.
+- PathFinding.js adapter behavior, reachable-cell sets, diagonal/path costs, wall-edge traversal, large-token footprints, occupancy, and deterministic client/server agreement.
 - Geometry and visibility algorithms.
 - Every typed wall and door-state sight/movement behavior.
 - Deterministic wall-segment to `THREE.Shape` and `ExtrudeGeometry` parameters.
 - Command validation and event reducers.
+- Server-authoritative movement-budget reset, spend, stale-revision rejection, DM override, and atomic position/budget persistence.
 - Generator determinism and invariants.
 - Open5e normalization and source-document filtering.
 - `three.quarks` effect JSON validation and spell-effect mapping.
@@ -1035,6 +1117,7 @@ Start real test rooms and verify:
 - Binary Schema patches for tokens, typed walls, fog, initiative, and HP.
 - Per-client State Views never serialize hidden HP, fog, notes, or secret tokens.
 - Invalid, stale, duplicated, and unauthorized messages do not mutate state.
+- Forged paths, understated costs, blocked destinations, stale wall graphs, and over-budget movement are rejected; the server accepts only its recomputed route.
 - Final commands persist before success acknowledgement and roll back live state on failure.
 - Automatic reconnection retains the client seat and synchronizes missed changes.
 - Manual reconnection restores callbacks and current state after page reload.
@@ -1047,7 +1130,7 @@ Use valid, malformed, truncated, animated, oversized, and decompression-bomb fix
 
 ### Renderer Tests
 
-Test pure scene-to-render projections separately from WebGL. Add fixed-scene screenshots for tactical and diorama smoke tests. Verify texture disposal, context recovery, tile selection, wall extrusion, Ready Player Me fallback, `three.quarks` batching, and quality fallback.
+Test pure scene-to-render projections separately from WebGL. Add fixed-scene screenshots for tactical and diorama smoke tests. Verify texture disposal, context recovery, tile selection, reachable-cell/path overlays, wall extrusion, camera-mode switching, immersive follow behavior, Ready Player Me idle/walk fallback, `three.quarks` batching, and quality fallback.
 
 ### Browser Tests
 
@@ -1063,6 +1146,7 @@ Use Playwright for:
 - Sandboxed extension origin, permission, toolbar action, and `postMessage` behavior.
 - Open5e cached/offline behavior and source attribution.
 - Ready Player Me completion events with a mocked allowed origin and rejection from an unknown origin.
+- Reachable-cell highlighting, destination click/keyboard selection, server route reconciliation, movement interruption, tactical/immersive camera switching, and reconnect during path playback.
 
 ### Connected Tests
 
@@ -1165,6 +1249,11 @@ Deletion work must be idempotent and retryable across Postgres and object storag
 - **Dice and rules automation:** shared rolls and combat basics are desired, but 2014 versus 2024 rules and the exact automation boundary remain unresolved. Open5e supplies content; it does not decide or implement the game engine behavior.
 - **Asset storage:** development storage is resolved as MinIO with 250 MB map and 25 MB token limits. Production provider, capacity, CDN, retention, backups, and cost controls remain unresolved.
 - **Authentication and monetization:** Supabase accounts are required for DMs and players. Social providers, account recovery policy, anonymous guests, subscriptions, paid tiers, and entitlements remain unresolved.
+- **Movement rules:** decide the diagonal cost convention, whether tokens block cells, how squeezing and tokens larger than one cell behave, how terrain may later express difficult movement cost, and whether the DM can override or edit a movement budget.
+- **Pre-character speed:** confirm the default/manual system-neutral allowance and reset behavior before milestone 8 supplies character speed; movement cannot depend directly on `rules-5e`.
+- **Ethereal consistency:** the canonical table currently makes `ethereal` block movement but not sight. Confirm this interpretation because the click-to-move request also described `ethereal` as non-blocking movement; until resolved, the canonical table governs pathfinding.
+- **Pathfinding package:** `pathfinding`/PathFinding.js is selected, but pinning requires a compatibility spike covering maintenance status, license, bundle/server cost, deterministic behavior, and custom wall-edge neighbors.
+- **Avatar locomotion:** select and license an idle/walk animation source compatible with Ready Player Me avatars, and define retargeting support when returned GLBs do not contain those clips.
 
 ### Before Milestone 8 Rules Automation
 
@@ -1218,8 +1307,9 @@ Every milestone is complete only when:
 1. Configure the real Supabase project and complete milestone 1 connected acceptance.
 2. Create the Jira task `[Realtime] Migrate room authority to Colyseus` in project `SCRUM` when Jira access is available.
 3. Revise and execute the detailed milestone 2 plan, starting with Colyseus Schema, persistence, typed empty walls, and reconnection.
-4. Release the tactical map and token slice before beginning fog or 3D work.
-5. Implement milestone 3 to complete the lean battle-map MVP.
+4. Run the PathFinding.js compatibility spike and approve diagonal, occupancy, footprint, and pre-character allowance rules before freezing the movement command contract.
+5. Release the tactical map, token, and authoritative movement-foundation slice before beginning fog or 3D work.
+6. Implement milestone 3 to complete the lean battle-map MVP and connect initiative to authoritative movement-budget resets; activate the complete player-facing click-to-move interaction in milestone 9 after the milestone-4 immersive renderer exists.
 
 ## 18. Work Tracking
 

@@ -1,10 +1,13 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { RoomScene } from '@hearth/room-schema';
-export { roomSchemaToScene, sceneToRoomSchema } from '@hearth/room-schema';
+import { RoomPresenceState } from '@hearth/room-schema';
 import {
-  commandResultSchema, createRoomSchema, inviteCodeSchema, multiplayerCommandSchemas,
+  commandResultSchema, createRoomSchema, inviteCodeSchema, mapPingEventSchema, mapPingSchema, multiplayerCommandSchemas,
+  parseActorProjectionV1,
+  projectionStreamMetadataSchema,
   type MultiplayerCommandName,
+  type MapPingEvent as DomainMapPingEvent, type MapPingInput,
   type Campaign, type Room, type RoomCommands, type RoomEvent, type RoomMember,
+  type ActorProjectionV1, type ProjectionStreamMetadata,
 } from '@hearth/domain';
 
 export function createRoomRepository(client: SupabaseClient) {
@@ -126,21 +129,21 @@ export interface SessionStorageLike {
 }
 
 export interface ColyseusRoomLike {
-  state: RoomScene;
+  state: RoomPresenceState;
   reconnectionToken: string;
   send(type: string, message: unknown): void;
   leave(consented?: boolean): Promise<unknown> | void;
-  onStateChange(callback: (state: RoomScene) => void): unknown;
+  onStateChange(callback: (state: RoomPresenceState) => void): unknown;
   onMessage(type: string | number, callback: (message: unknown) => void): unknown;
-  onDrop?(callback: (code?: number) => void): unknown;
-  onReconnect?(callback: () => void): unknown;
   onLeave(callback: (code?: number) => void): unknown;
   onError(callback: (code: number, message: string) => void): unknown;
+  onDrop?(callback: (code: number, reason?: string) => void): unknown;
+  onReconnect?(callback: () => void): unknown;
 }
 
 export interface ColyseusClientLike {
-  joinOrCreate(roomName: string, options: unknown, schema?: typeof RoomScene): Promise<ColyseusRoomLike>;
-  reconnect(token: string, schema?: typeof RoomScene): Promise<ColyseusRoomLike>;
+  joinOrCreate(roomName: string, options: unknown, schema?: typeof RoomPresenceState): Promise<ColyseusRoomLike>;
+  reconnect(token: string, schema?: typeof RoomPresenceState): Promise<ColyseusRoomLike>;
 }
 
 export interface MultiplayerConnectionOptions {
@@ -149,13 +152,18 @@ export interface MultiplayerConnectionOptions {
   accessToken: string;
   storage?: SessionStorageLike;
   client?: ColyseusClientLike;
-  onState: (state: RoomScene) => void;
+  onProjection: (projection: ActorProjectionV1) => void;
+  onPresence?: (state: RoomPresenceState) => void;
   onStatus: (status: ConnectionStatus) => void;
   onError?: (error: Error) => void;
+  onPing?: (ping: DomainMapPingEvent) => void;
   reconnectAttempts?: number;
   reconnectDelayMs?: number;
+  connectTimeoutMs?: number;
   requestTimeoutMs?: number;
 }
+
+export type { MapPingEvent } from '@hearth/domain';
 
 export interface MultiplayerRequestResult {
   type: MultiplayerCommandName;
@@ -176,6 +184,7 @@ export interface MultiplayerConnection {
     type: T,
     command: unknown,
   ): Promise<MultiplayerRequestResult>;
+  sendPing(input: MapPingInput): void;
   disconnect(): Promise<void>;
   getRoom(): ColyseusRoomLike | undefined;
 }
@@ -183,17 +192,43 @@ export interface MultiplayerConnection {
 export function createMultiplayerConnection(options: MultiplayerConnectionOptions): MultiplayerConnection {
   let client = options.client;
   const storageKey = `hearth:reconnection:${options.roomId}`;
+  const projectionStorageKey = `${storageKey}:projection`;
   let room: ColyseusRoomLike | undefined;
   let disposed = false;
   let generation = 0;
+  let lifecycle = 0;
+  let connectTask: Promise<void> | undefined;
   let reconnectTask: Promise<void> | undefined;
   const pending = new Map<string, {
     resolve: (result: MultiplayerRequestResult) => void;
     reject: (error: Error) => void;
     timer: ReturnType<typeof setTimeout>;
   }>();
+  let projectionMetadata: ProjectionStreamMetadata | undefined;
 
-  const reportError = (error: unknown) => options.onError?.(error instanceof Error ? error : new Error(String(error)));
+  const toError = (error: unknown): Error => error instanceof Error ? error : new Error(String(error));
+  const safeEndpoint = (endpoint: string): string => {
+    try {
+      const url = new URL(endpoint);
+      url.username = '';
+      url.password = '';
+      url.search = '';
+      url.hash = '';
+      return url.toString();
+    } catch {
+      return endpoint.replace(/([?&](?:access[_-]?token|token|auth|authorization)=)[^&]*/gi, '$1[redacted]');
+    }
+  };
+  const reportError = (error: unknown) => {
+    const cause = toError(error);
+    console.error('[hearth-sync] multiplayer connection error', {
+      endpoint: safeEndpoint(options.endpoint),
+      roomId: options.roomId,
+      message: cause.message,
+      stack: cause.stack,
+    });
+    options.onError?.(cause);
+  };
   const rejectPending = (error: Error): void => {
     for (const request of pending.values()) {
       clearTimeout(request.timer);
@@ -203,20 +238,110 @@ export function createMultiplayerConnection(options: MultiplayerConnectionOption
   };
   const getClient = async (): Promise<ColyseusClientLike> => {
     if (!client) {
-      const { Client } = await import('colyseus.js');
+      const { Client } = await import('@colyseus/sdk');
       client = new Client(options.endpoint) as unknown as ColyseusClientLike;
     }
     return client;
   };
 
+  const clearStoredSession = (token?: string): void => {
+    const storage = options.storage;
+    if (!storage) return;
+    if (token !== undefined && storage.getItem(storageKey) !== token) return;
+    storage.removeItem(storageKey);
+    storage.removeItem(projectionStorageKey);
+  };
+  const readStoredSession = (): { token: string; metadata?: ProjectionStreamMetadata } | undefined => {
+    const storage = options.storage;
+    const token = storage?.getItem(storageKey);
+    if (!storage) return undefined;
+    const rawMetadata = storage.getItem(projectionStorageKey);
+    if (!token || rawMetadata === null) {
+      clearStoredSession(token ?? undefined);
+      return undefined;
+    }
+    try {
+      const metadata = projectionStreamMetadataSchema.parse(JSON.parse(rawMetadata));
+      return { token, metadata };
+    } catch {
+      clearStoredSession(token);
+      return undefined;
+    }
+  };
+  const persistSession = (token: string): void => {
+    const storage = options.storage;
+    if (!storage) return;
+    storage.setItem(storageKey, token);
+    if (projectionMetadata) storage.setItem(projectionStorageKey, JSON.stringify(projectionMetadata));
+    else storage.removeItem(projectionStorageKey);
+  };
+  const closeRoom = async (target: ColyseusRoomLike, consented: boolean): Promise<void> => {
+    try {
+      const leaving = Promise.resolve(target.leave(consented));
+      if (!consented) { await leaving; return; }
+      let completed = false;
+      await Promise.race([
+        leaving.finally(() => { completed = true; }),
+        new Promise<void>((resolve) => setTimeout(resolve, 1_000)),
+      ]);
+      if (!completed) await Promise.resolve(target.leave(false));
+    } catch { /* The connection is already closing. */ }
+  };
+  const acquireRoom = async (
+    operation: number,
+    label: string,
+    factory: () => Promise<ColyseusRoomLike>,
+  ): Promise<ColyseusRoomLike | undefined> => {
+    const source = factory();
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        reject(new Error(`${label} timed out.`));
+      }, options.connectTimeoutMs ?? 10_000);
+    });
+    try {
+      const next = await Promise.race([source, timeout]);
+      if (disposed || operation !== lifecycle) {
+        await closeRoom(next, false);
+        return undefined;
+      }
+      return next;
+    } catch (error) {
+      if (timedOut) void source.then((late) => closeRoom(late, false)).catch(() => undefined);
+      throw toError(error);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
   const attach = (next: ColyseusRoomLike): void => {
     room = next;
     const attachedGeneration = ++generation;
-    options.storage?.setItem(storageKey, next.reconnectionToken);
-    options.onState(next.state);
+    persistSession(next.reconnectionToken);
+    options.onPresence?.(next.state);
     options.onStatus('online');
     next.onStateChange((state) => {
-      if (!disposed && attachedGeneration === generation) options.onState(state);
+      if (!disposed && attachedGeneration === generation) options.onPresence?.(state);
+    });
+    next.onMessage('scene.projection.v1', (raw) => {
+      if (disposed || attachedGeneration !== generation) return;
+      try {
+        const projection = parseActorProjectionV1(raw, projectionMetadata);
+        if (projectionMetadata === undefined && (projection.projectionRevision !== 0 || projection.streamReset?.kind !== 'initial')) {
+          throw new Error('The first projection must be an initial revision-zero snapshot.');
+        }
+        projectionMetadata = {
+          streamId: projection.streamId,
+          sceneRevision: projection.sceneRevision,
+          projectionRevision: projection.projectionRevision,
+        };
+        persistSession(next.reconnectionToken);
+        options.onProjection(projection);
+      } catch (error) {
+        reportError(error);
+      }
     });
     next.onMessage('command.result', (raw) => {
       if (attachedGeneration !== generation || typeof raw !== 'object' || raw === null) return;
@@ -241,21 +366,32 @@ export function createMultiplayerConnection(options: MultiplayerConnectionOption
         ));
       }
     });
-    next.onDrop?.(() => {
-      if (!disposed && attachedGeneration === generation) options.onStatus('reconnecting');
-    });
-    next.onReconnect?.(() => {
+    next.onMessage('map.ping', (raw) => {
       if (disposed || attachedGeneration !== generation) return;
-      options.storage?.setItem(storageKey, next.reconnectionToken);
-      options.onStatus('online');
+      const parsed = mapPingEventSchema.safeParse(raw);
+      if (parsed.success) options.onPing?.(parsed.data);
     });
     next.onError((code, message) => {
+      if (disposed || attachedGeneration !== generation) return;
       reportError(new Error(message));
-      if (code === 4003 && !disposed && attachedGeneration === generation) {
+      if (code === 4003) {
         room = undefined;
         generation++;
         beginReconnect(next.reconnectionToken);
       }
+    });
+    next.onDrop?.(() => {
+      if (disposed || attachedGeneration !== generation) return;
+      persistSession(next.reconnectionToken);
+      options.onStatus('reconnecting');
+    });
+    next.onReconnect?.(() => {
+      if (disposed || attachedGeneration !== generation) return;
+      options.onStatus('online');
+      queueMicrotask(() => {
+        if (disposed || attachedGeneration !== generation) return;
+        persistSession(next.reconnectionToken);
+      });
     });
     next.onLeave(() => {
       if (disposed || attachedGeneration !== generation) return;
@@ -267,30 +403,32 @@ export function createMultiplayerConnection(options: MultiplayerConnectionOption
 
   const beginReconnect = (token: string): void => {
     if (reconnectTask || disposed) return;
-    reconnectTask = reconnect(token).finally(() => { reconnectTask = undefined; });
+    const operation = ++lifecycle;
+    reconnectTask = reconnect(token, operation).finally(() => { reconnectTask = undefined; });
   };
 
-  const activate = async (next: ColyseusRoomLike): Promise<boolean> => {
-    if (disposed) {
-      await next.leave(true);
-      return false;
-    }
+  const activate = (next: ColyseusRoomLike, operation: number): boolean => {
+    if (disposed || operation !== lifecycle) { void closeRoom(next, false); return false; }
     attach(next);
     return true;
   };
 
-  const reconnect = async (token: string): Promise<void> => {
+  const reconnect = async (token: string, operation: number): Promise<void> => {
     options.onStatus('reconnecting');
     const attempts = options.reconnectAttempts ?? 5;
     const delay = options.reconnectDelayMs ?? 250;
     for (let attempt = 0; attempt < attempts && !disposed; attempt++) {
       try {
-        const reconnected = await (await getClient()).reconnect(token, RoomScene);
-        await activate(reconnected);
+        const currentClient = await getClient();
+        if (disposed || operation !== lifecycle) return;
+        const reconnected = await acquireRoom(operation, 'Multiplayer reconnection', () => currentClient.reconnect(token, RoomPresenceState));
+        if (reconnected) activate(reconnected, operation);
         return;
       } catch (error) {
+        if (disposed || operation !== lifecycle) return;
         if (attempt === attempts - 1) {
-          options.storage?.removeItem(storageKey);
+          clearStoredSession(token);
+          projectionMetadata = undefined;
           rejectPending(new Error('Multiplayer reconnection failed.'));
           reportError(error);
           return;
@@ -303,22 +441,41 @@ export function createMultiplayerConnection(options: MultiplayerConnectionOption
   return {
     async connect() {
       if (room) return;
+      if (connectTask) return connectTask;
       disposed = false;
+      projectionMetadata = undefined;
+      const operation = ++lifecycle;
       options.onStatus('connecting');
-      const token = options.storage?.getItem(storageKey);
-      if (token) {
-        try {
-          await activate(await (await getClient()).reconnect(token, RoomScene));
-          return;
-        } catch (error) {
-          options.storage?.removeItem(storageKey);
-          reportError(error);
+      const task = (async () => {
+        const currentClient = await getClient();
+        if (disposed || operation !== lifecycle) return;
+        const stored = readStoredSession();
+        if (stored) {
+          projectionMetadata = stored.metadata;
+          try {
+            const reconnected = await acquireRoom(operation, 'Multiplayer reconnection', () => currentClient.reconnect(stored.token, RoomPresenceState));
+            if (reconnected) activate(reconnected, operation);
+            return;
+          } catch (error) {
+            if (disposed || operation !== lifecycle) return;
+            clearStoredSession(stored.token);
+            projectionMetadata = undefined;
+            reportError(error);
+          }
         }
+        const joined = await acquireRoom(operation, 'Multiplayer connection', () => currentClient.joinOrCreate('battle', {
+          databaseRoomId: options.roomId,
+          accessToken: options.accessToken,
+        }, RoomPresenceState));
+        if (joined) activate(joined, operation);
+      })();
+      connectTask = task;
+      try { await task; }
+      catch (error) {
+        if (!disposed && operation === lifecycle) reportError(error);
+        throw error;
       }
-      await activate(await (await getClient()).joinOrCreate('battle', {
-        roomId: options.roomId,
-        accessToken: options.accessToken,
-      }, RoomScene));
+      finally { if (connectTask === task) connectTask = undefined; }
     },
     send(type, command) {
       if (!room) throw new Error('Multiplayer room is not connected.');
@@ -345,20 +502,29 @@ export function createMultiplayerConnection(options: MultiplayerConnectionOption
         }
       });
     },
+    sendPing(input) {
+      if (!room) throw new Error('Multiplayer room is not connected.');
+      room.send('map.ping', mapPingSchema.parse(input));
+    },
     async disconnect() {
       disposed = true;
+      lifecycle++;
       generation++;
+      projectionMetadata = undefined;
       rejectPending(new Error('Multiplayer connection closed.'));
-      options.storage?.removeItem(storageKey);
       const current = room;
       room = undefined;
-      await current?.leave(true);
+      const storedToken = current?.reconnectionToken ?? options.storage?.getItem(storageKey) ?? undefined;
+      clearStoredSession(storedToken);
+      if (current) {
+        await closeRoom(current, true);
+      }
     },
     getRoom: () => room,
   };
 }
 
-export function getConnectedUserIds(state: RoomScene): Set<string> {
+export function getConnectedUserIds(state: RoomPresenceState): Set<string> {
   const userIds = new Set<string>();
   state.connections.forEach((connection) => {
     if (connection.connected) userIds.add(connection.userId);

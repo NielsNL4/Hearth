@@ -5,6 +5,7 @@ export interface Config {
   supabaseUrl: string;
   supabaseServiceRoleKey: string;
   s3Endpoint: string;
+  s3PublicEndpoint: string;
   s3Region: string;
   s3AccessKey: string;
   s3SecretKey: string;
@@ -49,6 +50,11 @@ function url(env: NodeJS.ProcessEnv, name: string): string {
   return value.replace(/\/$/, '');
 }
 
+function optionalUrl(env: NodeJS.ProcessEnv, name: string, fallback: string): string {
+  if (!env[name]?.trim()) return fallback;
+  return url(env, name);
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv): Config {
   const corsOrigins = required(env, 'CORS_ORIGINS').split(',').map((entry) => entry.trim());
   if (corsOrigins.some((origin) => origin === '*' || new URL(origin).origin !== origin)) {
@@ -61,6 +67,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     supabaseUrl: url(env, 'SUPABASE_URL'),
     supabaseServiceRoleKey: required(env, 'SUPABASE_SERVICE_ROLE_KEY'),
     s3Endpoint: url(env, 'S3_ENDPOINT'),
+    s3PublicEndpoint: optionalUrl(env, 'S3_PUBLIC_ENDPOINT', url(env, 'S3_ENDPOINT')),
     s3Region: env.S3_REGION?.trim() || 'us-east-1',
     s3AccessKey: required(env, 'S3_ACCESS_KEY'),
     s3SecretKey: required(env, 'S3_SECRET_KEY'),

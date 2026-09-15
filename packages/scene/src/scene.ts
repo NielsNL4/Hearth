@@ -1,5 +1,18 @@
 import { sceneV1Schema, sceneV2Schema } from './schema.js';
-import type { SceneV1, SceneV2 } from './types.js';
+import type { SceneV1, SceneV2, TokenMovementState } from './types.js';
+
+export function createTokenMovementState(): TokenMovementState {
+  return {
+    allowanceCells: null,
+    spentCells: 0,
+    activePath: [],
+    pathCostCells: 0,
+    pathStartedAtServerMs: null,
+    millisecondsPerCell: 250,
+    status: 'idle',
+    revision: 0,
+  };
+}
 
 export function createEmptySceneV1(): SceneV1 {
   return {
@@ -15,13 +28,17 @@ export function createEmptyScene(): SceneV2 {
     coordinateSystem: { origin: 'top-left', axes: 'x-right-y-down', worldUnit: 'map-pixel' },
     map: null,
     grid: { type: 'square', visible: true, cellSize: 1, offset: { x: 0, y: 0 }, distancePerCell: 5, unit: 'ft', snap: true },
-    permissions: { playerMovement: 'owned' },
+    permissions: { playerMovement: 'owned', playerDrawing: 'own', playerPerspectiveView: false },
+    navigationRevision: 0,
+    wallRevision: 0,
     tokens: {},
     walls: {},
-    fog: { version: 1, mode: 'shared', operations: [] },
-    initiative: { version: 1, active: false, round: 0, turnIndex: null, entries: [] },
+    fog: { version: 1, mode: 'shared', enabled: false, base: 'revealed', operations: [], revision: 0 },
+    initiative: { version: 1, active: false, round: 0, turnIndex: null, entries: [], revision: 0 },
     drawings: {},
+    drawingRevision: 0,
     structures: {},
+    structureRevision: 0,
     lights: {},
     effects: {},
     extensions: {},

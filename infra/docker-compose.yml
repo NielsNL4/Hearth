@@ -24,6 +24,7 @@ services:
       SUPABASE_URL: ${SUPABASE_URL:?SUPABASE_URL is required}
       SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:?SUPABASE_SERVICE_ROLE_KEY is required}
       S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:9000}
       S3_REGION: us-east-1
       S3_ACCESS_KEY: ${MINIO_ROOT_USER:-hearth-assets}
       S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-change-this-minio-password}

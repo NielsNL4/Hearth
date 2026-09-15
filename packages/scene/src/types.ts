@@ -8,6 +8,22 @@ export interface Size {
   height: number;
 }
 
+export interface GridPoint {
+  column: number;
+  row: number;
+}
+
+export interface TokenMovementState {
+  allowanceCells: number | null;
+  spentCells: number;
+  activePath: GridPoint[];
+  pathCostCells: number;
+  pathStartedAtServerMs: number | null;
+  millisecondsPerCell: number;
+  status: 'idle' | 'moving' | 'interrupted';
+  revision: number;
+}
+
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 export interface SceneV1 {
@@ -35,6 +51,20 @@ export interface TokenRecord {
   hpHidden: boolean;
   z: number;
   revision: number;
+  movement?: TokenMovementState;
+}
+
+export type WallMaterial = 'default' | 'masonry' | 'wood' | 'metal';
+
+export interface WallOpening {
+  type: 'window';
+  /** Fractional position along the wall from start (0) to end (1). */
+  start: number;
+  /** Fractional position along the wall from start (0) to end (1). */
+  end: number;
+  /** Height above the wall elevation. */
+  bottom: number;
+  height: number;
 }
 
 interface WallBase {
@@ -45,6 +75,8 @@ interface WallBase {
   thickness: number;
   elevation: number;
   revision: number;
+  material: WallMaterial;
+  openings: WallOpening[];
 }
 
 export interface BlockingWall extends WallBase { type: 'blocking' }
@@ -78,19 +110,34 @@ export interface DrawingRecord {
   points: Point[];
   color: string;
   width: number;
+  fill?: string | null;
+  hidden?: boolean;
+  ownerId?: string;
   z: number;
   revision: number;
 }
 
-export interface StructureRecord {
+export type StructureMaterial = WallMaterial;
+export type StructureKind = 'block' | 'floor' | 'roof';
+
+interface StructureBase {
   id: string;
+  kind: StructureKind;
   position: Point;
   size: Size;
   rotation: number;
   label: string;
   z: number;
+  material: StructureMaterial;
+  baseElevation: number;
+  slabHeight: number;
   revision: number;
 }
+
+export interface BlockStructure extends StructureBase { kind: 'block' }
+export interface FloorStructure extends StructureBase { kind: 'floor' }
+export interface RoofStructure extends StructureBase { kind: 'roof' }
+export type StructureRecord = BlockStructure | FloorStructure | RoofStructure;
 
 export interface LightRecord {
   id: string;
@@ -135,13 +182,26 @@ export interface SceneV2 {
   };
   permissions: {
     playerMovement: 'owned' | 'all';
+    playerDrawing?: 'none' | 'own' | 'all';
+    playerPerspectiveView?: boolean;
   };
+  navigationRevision?: number;
+  wallRevision?: number;
   tokens: Record<string, TokenRecord>;
   walls: Record<string, WallRecord>;
-  fog: { version: 1; mode: 'shared' | 'per-player'; operations: FogOperation[] };
-  initiative: { version: 1; active: boolean; round: number; turnIndex: number | null; entries: InitiativeEntry[] };
+  fog: {
+    version: 1;
+    mode: 'shared' | 'per-player';
+    enabled?: boolean;
+    base?: 'revealed' | 'concealed';
+    operations: FogOperation[];
+    revision?: number;
+  };
+  initiative: { version: 1; active: boolean; round: number; turnIndex: number | null; entries: InitiativeEntry[]; revision?: number };
   drawings: Record<string, DrawingRecord>;
+  drawingRevision?: number;
   structures: Record<string, StructureRecord>;
+  structureRevision?: number;
   lights: Record<string, LightRecord>;
   effects: Record<string, EffectRecord>;
   extensions: Record<string, JsonValue>;

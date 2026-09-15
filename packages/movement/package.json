@@ -1,0 +1,14 @@
+{
+  "name": "@hearth/movement",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@hearth/scene": "*",
+    "pathfinding": "0.4.18"
+  },
+  "devDependencies": {
+    "@types/pathfinding": "^0.1.0"
+  }
+}

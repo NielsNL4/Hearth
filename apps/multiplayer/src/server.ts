@@ -8,7 +8,7 @@ export function createServerConfig(dependencies: BattleRoomDependencies) {
   const BattleRoom = createBattleRoom(dependencies);
   return defineServer({
     rooms: {
-      battle: defineRoom(BattleRoom).filterBy(['roomId']),
+      battle: defineRoom(BattleRoom).filterBy(['databaseRoomId']),
     },
     initializeExpress(app: Application) {
       app.get('/health', (_request: Request, response: Response) => response.status(200).json({ status: 'ok' }));

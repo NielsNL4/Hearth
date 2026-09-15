@@ -9,3 +9,4 @@ test-results/
 .supabase/
 supabase/.temp/
 supabase/.branches/
+.slim/deepwork/
